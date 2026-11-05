@@ -26,7 +26,7 @@ func TestRealFFplay(t *testing.T) {
 	if err := writePNG(osd, RenderOSD(newFonts(), 320, 240, ch, nil, time.Now())); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Play(vid, 12.5, osd, 10.5, 15.5); err != nil {
+	if err := p.Play(vid, 12.5, osd, 3); err != nil {
 		t.Fatal(err)
 	}
 	select {

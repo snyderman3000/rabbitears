@@ -442,9 +442,7 @@ func (tv *TV) start(ch *Channel, idx int, off float64, withSnow, withOSD, withIn
 	if withInfo {
 		secs += 2
 	}
-	// ffplay's clock starts at the keyframe before the seek point
-	from, to := off-2, off+secs
-	if err := tv.player.Play(it.Path, off, osd, from, to); err != nil {
+	if err := tv.player.Play(it.Path, off, osd, secs); err != nil {
 		tv.noSignal(ch, err.Error())
 		return
 	}

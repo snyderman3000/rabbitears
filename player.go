@@ -42,13 +42,16 @@ func NewPlayer(bin, work string) *Player {
 	return &Player{Bin: bin, Work: work, LogLvl: "error", Exited: make(chan exitEvent, 4)}
 }
 
-// filterGraph builds -vf: optional OSD overlay between [from, to] seconds of
-// the file's own timeline (ffplay's t is the frame's timestamp, which after
-// a seek starts near the seek point, not at 0), then the panel flip.
-func (p *Player) filterGraph(osd string, from, to float64) string {
+// filterGraph builds -vf: optional OSD overlay for the first osdFrames frames
+// of this ffplay, then the panel flip. Counted in frames from the start rather
+// than by timestamp: ffplay backs up to the keyframe before -ss and plays from
+// there. vhsify puts a keyframe every second, but other files can have them
+// many seconds apart, and a timestamp window then made the channel number turn
+// up late, by a different amount on every channel change.
+func (p *Player) filterGraph(osd string, osdFrames int) string {
 	var parts []string
 	if osd != "" {
-		parts = append(parts, fmt.Sprintf("movie=%s[osd];[in][osd]overlay=0:0:enable='between(t,%.2f,%.2f)'", ffEscape(osd), from, to))
+		parts = append(parts, fmt.Sprintf("movie=%s[osd];[in][osd]overlay=0:0:enable='lt(n,%d)'", ffEscape(osd), osdFrames))
 	}
 	if p.Extra != "" {
 		parts = append(parts, p.Extra)
@@ -68,14 +71,16 @@ func ffEscape(s string) string {
 	return r.Replace(s)
 }
 
-func (p *Player) Play(path string, ss float64, osd string, osdFrom, osdTo float64) error {
+// Play starts path at ss seconds with the OSD up for about osdSecs.
+func (p *Player) Play(path string, ss float64, osd string, osdSecs float64) error {
 	p.Stop()
 	os.Remove(filepath.Join(p.Work, "pos.cfg"))
 	args := []string{"-autoexit", "-loglevel", p.LogLvl}
 	if ss > 0.05 {
 		args = append(args, "-ss", fmt.Sprintf("%.2f", ss))
 	}
-	args = append(args, "-vf", p.filterGraph(osd, osdFrom, osdTo), "-i", path)
+	osdFrames := int(osdSecs*24 + 0.5) // counted at 24 fps: a little shorter on 30 fps video
+	args = append(args, "-vf", p.filterGraph(osd, osdFrames), "-i", path)
 	cmd := exec.Command(p.Bin, args...)
 	cmd.Dir = p.Work
 	cmd.Stdout = nil
