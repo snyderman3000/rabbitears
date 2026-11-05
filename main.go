@@ -22,6 +22,7 @@ type Config struct {
 	TVFolder     string  `json:"tv_folder"`     // where the channels live
 	FirstChannel int     `json:"first_channel"` // number of the first unnumbered channel
 	StaticMS     int     `json:"static_ms"`     // how long the snow shows between channels
+	StaticSound  float64 `json:"static_sound"`  // seconds of snow + hiss as the new channel starts; 0 turns it off
 	OSDSeconds   float64 `json:"osd_seconds"`   // how long the channel number stays up
 	Live         bool    `json:"live"`          // true: channels are "on air"; false: start from the top
 	Player       string  `json:"player"`        // ffplay binary
@@ -34,6 +35,7 @@ func defaultConfig() Config {
 		TVFolder:     "/mnt/SDCARD/Media/TV",
 		FirstChannel: 2,
 		StaticMS:     350,
+		StaticSound:  0.5,
 		OSDSeconds:   3,
 		Live:         true,
 		Player:       "/mnt/SDCARD/.tmp_update/bin/ffplay",
@@ -123,6 +125,7 @@ func main() {
 		problem: problem,
 	}
 	tv.player.Extra = cfg.ExtraFilters
+	tv.player.Static = cfg.StaticSound
 	tv.player.NoFlip = os.Getenv("RABBITEARS_NOFLIP") != ""
 	input := "/dev/input/event0"
 	if d := os.Getenv("RABBITEARS_INPUT"); d != "" {
@@ -442,9 +445,7 @@ func (tv *TV) start(ch *Channel, idx int, off float64, withSnow, withOSD, withIn
 	if withInfo {
 		secs += 2
 	}
-	// ffplay's clock starts at the keyframe before the seek point
-	from, to := off-2, off+secs
-	if err := tv.player.Play(it.Path, off, osd, from, to); err != nil {
+	if err := tv.player.Play(it.Path, off, osd, secs, withSnow); err != nil {
 		tv.noSignal(ch, err.Error())
 		return
 	}
@@ -455,6 +456,9 @@ func (tv *TV) start(ch *Channel, idx int, off float64, withSnow, withOSD, withIn
 			tv.present()
 			time.Sleep(33 * time.Millisecond)
 		}
+	} else if withSnow && tv.cfg.StaticSound > 0 {
+		// no cover at all: leave the screen alone and let ffplay's own
+		// static (picture and sound) be the channel change
 	} else {
 		tv.canvas.Fill(0, 0, tv.canvas.W, tv.canvas.H, colBlack)
 		tv.present()

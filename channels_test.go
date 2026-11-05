@@ -99,8 +99,8 @@ func TestProbeAndScan(t *testing.T) {
 
 func TestFilterGraph(t *testing.T) {
 	p := &Player{}
-	g := p.filterGraph("/tmp/rabbitears/osd1.png", 8, 13)
-	want := "movie=/tmp/rabbitears/osd1.png[osd];[in][osd]overlay=0:0:enable='between(t,8.00,13.00)',hflip,vflip"
+	g := p.filterGraph("/tmp/rabbitears/osd1.png", 120, 0)
+	want := "movie=/tmp/rabbitears/osd1.png[osd];[in][osd]overlay=0:0:enable='lt(n,120)',hflip,vflip"
 	if g != want {
 		t.Fatalf("\n got %s\nwant %s", g, want)
 	}

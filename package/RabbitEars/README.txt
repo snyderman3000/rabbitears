@@ -35,7 +35,10 @@ CONTROLS
 SETTINGS  (App/RabbitEars/data/config.json, created on first run)
   tv_folder       where your channels live
   first_channel   number of the first channel (default 2)
-  static_ms       how long the snow shows when you change channel
+  static_ms       how long the snow shows when you change channel; 0 = none
+                  (with static_sound on, the static below is the whole change)
+  static_sound    seconds of static with hiss as the new channel starts
+                  (default 0.5; 0 turns it off)
   osd_seconds     how long the channel number stays on screen
   live            true = channels are always on air; false = every channel
                   starts its show from the beginning

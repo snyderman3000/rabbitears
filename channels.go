@@ -342,6 +342,7 @@ func probeMP4(path string) (float64, int, int) {
 }
 
 func parseMoov(b []byte) (dur float64, w, h int) {
+	var cw, ch int
 	walkBoxes(b, func(typ string, body []byte) bool {
 		switch typ {
 		case "mvhd":
@@ -361,7 +362,7 @@ func parseMoov(b []byte) (dur float64, w, h int) {
 					dur = float64(d) / float64(ts)
 				}
 			}
-		case "trak":
+		case "trak", "mdia", "minf", "stbl":
 			return true
 		case "tkhd":
 			if w == 0 && len(body) >= 84 {
@@ -371,11 +372,26 @@ func parseMoov(b []byte) (dur float64, w, h int) {
 					w, h = tw, th
 				}
 			}
+		case "stsd":
+			// the coded picture size from the video sample entry. tkhd holds the
+			// display size, which differs for non-square pixels (a 710x480 file
+			// shown at 631x480): the OSD is overlaid on the coded frame, so it
+			// must be drawn at the coded size or it lands short of the corner.
+			if cw == 0 && len(body) >= 44 && videoEntries[string(body[12:16])] {
+				cw = int(binary.BigEndian.Uint16(body[40:]))
+				ch = int(binary.BigEndian.Uint16(body[42:]))
+			}
 		}
 		return false
 	})
+	if cw > 0 && ch > 0 {
+		w, h = cw, ch
+	}
 	return
 }
+
+// sample entry types whose stsd record has the visual layout (width/height at 32/34)
+var videoEntries = map[string]bool{"avc1": true, "avc3": true, "hvc1": true, "hev1": true, "mp4v": true, "s263": true, "jpeg": true, "mjpa": true}
 
 // walkBoxes calls fn for each box; returning true descends into it.
 func walkBoxes(b []byte, fn func(string, []byte) bool) {
