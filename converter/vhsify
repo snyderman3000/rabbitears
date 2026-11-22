@@ -156,10 +156,13 @@ build_filter() {
 }
 
 # Audio: mono, VHS linear-track bandwidth, gentle compression, faint hiss.
+# The downmix keeps the centre channel at full level: in 5.1 mixes that's
+# where the dialogue is (a plain left+right mix loses every word), and the
+# surrounds go in a little quieter so music doesn't bury the voices.
 build_audio() {
   local hiss
   case "$WEAR" in 0) hiss=0.0015 ;; 1) hiss=0.003 ;; 2) hiss=0.005 ;; *) hiss=0.008 ;; esac
-  printf 'aresample=32000,pan=mono|c0=0.5*c0+0.5*c1,highpass=f=70,lowpass=f=10000,acompressor=threshold=0.125:ratio=3:attack=20:release=250:makeup=1.6,aeval=val(0)+%s*(random(0)*2-1):c=same,alimiter=limit=0.95' "$hiss"
+  printf 'aresample=32000:clev=1.0:slev=0.5:lfe_mix_level=0,aformat=channel_layouts=mono,dynaudnorm=f=250:g=15:m=8,highpass=f=70,lowpass=f=10000,acompressor=threshold=0.125:ratio=3:attack=20:release=250:makeup=1.6,aeval=val(0)+%s*(random(0)*2-1):c=same,alimiter=limit=0.95' "$hiss"
 }
 
 probe_fps() {
