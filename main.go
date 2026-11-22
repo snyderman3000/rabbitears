@@ -16,28 +16,90 @@ import (
 	"time"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
+
+const (
+	ModeLive = "live"
+	ModeDVR  = "dvr"
+)
 
 type Config struct {
-	TVFolder     string  `json:"tv_folder"`     // where the channels live
-	FirstChannel int     `json:"first_channel"` // number of the first unnumbered channel
-	StaticMS     int     `json:"static_ms"`     // how long the snow shows between channels
-	OSDSeconds   float64 `json:"osd_seconds"`   // how long the channel number stays up
-	Live         bool    `json:"live"`          // true: channels are "on air"; false: start from the top
-	Player       string  `json:"player"`        // ffplay binary
-	ExtraFilters string  `json:"extra_filters"` // extra ffplay -vf filters, e.g. scanlines
-	PowerOnLast  bool    `json:"power_on_last"` // come back on the channel you left
+	TVFolder     string  `json:"tv_folder"`      // where the channels live
+	FirstChannel int     `json:"first_channel"`  // number of the first unnumbered channel
+	Mode         string  `json:"mode"`           // "live" (always on air) or "dvr" (on demand)
+	Order        string  `json:"show_order"`     // rotate, in order or shuffle
+	Commercials  bool    `json:"commercials"`    // play commercial breaks (live TV)
+	AdsEveryMin  float64 `json:"ads_every_min"`  // minutes between breaks inside a show; 0 = between shows only
+	AdsPerBreak  int     `json:"ads_per_break"`  // commercials in each break
+	StaticMS     int     `json:"static_ms"`      // how long the snow shows between channels
+	OSDSeconds   float64 `json:"osd_seconds"`    // how long the channel number stays up
+	Player       string  `json:"player"`         // ffplay binary
+	ExtraFilters string  `json:"extra_filters"`  // extra ffplay -vf filters, e.g. scanlines
+	PowerOnLast  bool    `json:"power_on_last"`  // come back on the channel you left
+	OldLive      *bool   `json:"live,omitempty"` // 1.0 setting, read once and replaced by mode
 }
 
 func defaultConfig() Config {
 	return Config{
 		TVFolder:     "/mnt/SDCARD/Media/TV",
 		FirstChannel: 2,
+		Mode:         ModeLive,
+		Order:        OrderRotate,
+		Commercials:  true,
+		AdsEveryMin:  8,
+		AdsPerBreak:  3,
 		StaticMS:     350,
 		OSDSeconds:   3,
-		Live:         true,
 		Player:       "/mnt/SDCARD/.tmp_update/bin/ffplay",
 		PowerOnLast:  true,
+	}
+}
+
+func (c *Config) tidy() {
+	if c.OldLive != nil {
+		if !*c.OldLive {
+			c.Mode = ModeDVR
+		}
+		c.OldLive = nil
+	}
+	if c.Mode != ModeDVR {
+		c.Mode = ModeLive
+	}
+	if o := parseOrder(c.Order); o != "" {
+		c.Order = o
+	} else {
+		c.Order = OrderRotate
+	}
+	if c.FirstChannel < 1 {
+		c.FirstChannel = 2
+	}
+	if c.StaticMS < 0 {
+		c.StaticMS = 0
+	}
+	if c.OSDSeconds <= 0 {
+		c.OSDSeconds = 3
+	}
+	if c.AdsEveryMin < 0 {
+		c.AdsEveryMin = 0
+	}
+	if c.AdsEveryMin > 0 && c.AdsEveryMin < 3 {
+		c.AdsEveryMin = 3
+	}
+	if c.AdsPerBreak < 1 {
+		c.AdsPerBreak = 1
+	}
+	if c.AdsPerBreak > 10 {
+		c.AdsPerBreak = 10
+	}
+}
+
+func (c *Config) adOptions() AdOptions {
+	return AdOptions{On: c.Commercials, EveryMin: c.AdsEveryMin, PerBreak: c.AdsPerBreak}
+}
+
+func saveConfig(path string, cfg Config) {
+	if out, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+		os.WriteFile(path, append(out, '\n'), 0o644)
 	}
 }
 
@@ -46,23 +108,17 @@ func loadConfig(path string) (Config, string) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if out, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-				os.WriteFile(path, append(out, '\n'), 0o644)
-			}
+			saveConfig(path, cfg)
 		}
 		return cfg, ""
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return defaultConfig(), fmt.Sprintf("config.json: %v", err)
 	}
-	if cfg.FirstChannel < 1 {
-		cfg.FirstChannel = 2
-	}
-	if cfg.StaticMS < 0 {
-		cfg.StaticMS = 0
-	}
-	if cfg.OSDSeconds <= 0 {
-		cfg.OSDSeconds = 3
+	upgraded := cfg.OldLive != nil || !strings.Contains(string(b), `"mode"`)
+	cfg.tidy()
+	if upgraded {
+		saveConfig(path, cfg) // add the 1.1 settings so they can be edited
 	}
 	return cfg, ""
 }
@@ -72,7 +128,7 @@ type State struct {
 }
 
 func main() {
-	shot := flag.String("shot", "", "render a demo screen to shot.png: osd|info|guide|bars|nosignal|snow|on|off")
+	shot := flag.String("shot", "", "render a demo screen to shot.png: osd|info|ad|guide|menu|dvr|dvr2|bars|nosignal|snow|on|off")
 	icon := flag.String("icon", "", "write the app icon PNG to this path")
 	scan := flag.String("scan", "", "print the lineup for a TV folder and exit")
 	flag.Parse()
@@ -111,16 +167,18 @@ func main() {
 		log.Fatalf("framebuffer: %v", err)
 	}
 	defer fb.Close()
+	log.Printf("screen %dx%d", fb.W, fb.H)
 
 	tv := &TV{
 		cfg:     cfg,
 		dataDir: dataDir,
 		fb:      fb,
-		canvas:  NewCanvas(fb.W, fb.H),
+		canvas:  NewCanvas(640, 480), // drawn at 640x480, scaled to the panel
 		fonts:   newFonts(),
 		keys:    make(chan int, 16),
 		player:  NewPlayer(cfg.Player, "/tmp/rabbitears"),
 		problem: problem,
+		dvr:     newDVR(filepath.Join(dataDir, "dvr.json")),
 	}
 	tv.player.Extra = cfg.ExtraFilters
 	tv.player.NoFlip = os.Getenv("RABBITEARS_NOFLIP") != ""
@@ -135,6 +193,9 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	go func() {
 		<-sig
+		if tv.mode == modeDVRPlay {
+			tv.dvr.stopPlaying(false)
+		}
 		tv.player.Stop()
 		os.Exit(0)
 	}()
@@ -142,22 +203,33 @@ func main() {
 }
 
 func printLineup(dir string) {
-	chans := Scan(dir, defaultConfig().FirstChannel, &durCache{m: map[string]cacheEntry{}})
+	cfg := defaultConfig()
+	chans := Scan(dir, ScanOptions{First: cfg.FirstChannel, Order: cfg.Order}, &durCache{m: map[string]cacheEntry{}})
 	if len(chans) == 0 {
 		fmt.Println("no channels found in", dir)
 		return
 	}
 	now := time.Now()
 	for _, c := range chans {
-		i, off := c.At(now)
-		it := c.Items[i]
-		fmt.Printf("CH %-3d %-28s %3d video(s)  now: %s @ %s", c.Num, c.Name, len(c.Items), it.Title, time.Duration(off*float64(time.Second)).Round(time.Second))
-		if it.Dur <= 0 {
+		c.Build(cfg.adOptions())
+		si, off := c.At(now)
+		seg := c.Segs[si]
+		what := seg.Item.Label()
+		if seg.Ad {
+			what = "commercial: " + seg.Item.Title
+		}
+		fmt.Printf("CH %-3d %-24s %3d video(s), %d commercials, %s  now: %s @ %s", c.Num, c.Name, len(c.Items), len(c.Ads), c.Order, what, time.Duration((seg.From+off)*float64(time.Second)).Round(time.Second))
+		if seg.Item.Dur <= 0 {
 			fmt.Print("  (length unknown — not an MP4?)")
-		} else if it.H > 480 {
-			fmt.Printf("  (%dx%d — run it through vhsify)", it.W, it.H)
+		} else if seg.Item.H > 480 {
+			fmt.Printf("  (%dx%d — run it through vhsify)", seg.Item.W, seg.Item.H)
 		}
 		fmt.Println()
+		for k, a := range c.Upcoming(now, 4) {
+			if k > 0 {
+				fmt.Printf("         %s  %s\n", a.Start.Format("3:04"), a.Item.Label())
+			}
+		}
 	}
 }
 
@@ -176,12 +248,15 @@ type TV struct {
 	chans    []*Channel
 	cur      int
 	prev     int
-	curItem  int
+	curSeg   int
+	segLimit float64 // how long the playing segment should run
 	snow     Snow
 	fails    int
 	lastTick time.Time
-	mode     int // modeWatch, modeGuide, modeNoSignal, modeEmpty
+	mode     int
 	guide    Guide
+	menu     Menu
+	dvr      *DVR
 	why      string
 	pending  []int
 }
@@ -191,17 +266,51 @@ const (
 	modeGuide
 	modeNoSignal
 	modeEmpty
+	modeMenu
+	modeDVR
+	modeDVRPlay
 )
 
 func (tv *TV) present() {
 	tv.fb.Reset()
-	tv.fb.Present(tv.canvas)
+	tv.fb.PresentFit(tv.canvas)
 }
+
+func (tv *TV) configPath() string { return filepath.Join(tv.dataDir, "config.json") }
 
 func (tv *TV) rescan() {
 	cache := loadCache(filepath.Join(tv.dataDir, "lengths.json"))
-	tv.chans = Scan(tv.cfg.TVFolder, tv.cfg.FirstChannel, cache)
-	log.Printf("%d channels in %s", len(tv.chans), tv.cfg.TVFolder)
+	keep := ""
+	if tv.cur < len(tv.chans) {
+		keep = tv.chans[tv.cur].Key
+	}
+	tv.chans = Scan(tv.cfg.TVFolder, ScanOptions{First: tv.cfg.FirstChannel, Order: tv.cfg.Order}, cache)
+	for _, c := range tv.chans {
+		c.Build(tv.cfg.adOptions())
+	}
+	tv.cur, tv.prev = 0, 0
+	for i, c := range tv.chans {
+		if c.Key == keep {
+			tv.cur, tv.prev = i, i
+		}
+	}
+	tv.dvr.setLineup(tv.cfg.TVFolder, tv.chans)
+	ads := 0
+	if len(tv.chans) > 0 {
+		ads = len(tv.chans[0].Ads)
+	}
+	log.Printf("%d channels in %s (order %s, commercials %v, %d in the shared pool)", len(tv.chans), tv.cfg.TVFolder, tv.cfg.Order, tv.cfg.Commercials, ads)
+}
+
+// adsFound counts the distinct commercials on the card (for the menu).
+func (tv *TV) adsFound() int {
+	seen := map[string]bool{}
+	for _, c := range tv.chans {
+		for _, a := range c.Ads {
+			seen[a.Path] = true
+		}
+	}
+	return len(seen)
 }
 
 func (tv *TV) Run() {
@@ -216,22 +325,19 @@ func (tv *TV) Run() {
 		if b, err := os.ReadFile(filepath.Join(tv.dataDir, "state.json")); err == nil && json.Unmarshal(b, &st) == nil {
 			for i, c := range tv.chans {
 				if c.Key == st.Channel {
-					tv.cur = i
+					tv.cur, tv.prev = i, i
 				}
 			}
 		}
 	}
-	tv.prev = tv.cur
 
 	tv.powerOn()
 	if _, err := os.Stat(tv.cfg.Player); err != nil {
 		tv.showEmpty("PLAYER MISSING", "Onion's video player wasn't found at", tv.cfg.Player)
 	} else if tv.problem != "" {
 		tv.showEmpty("CONFIG ERROR", tv.problem, "Fix App/RabbitEars/data/config.json")
-	} else if len(tv.chans) == 0 {
-		tv.showEmpty("NO CHANNELS", "Put videos (or folders of episodes) in", "SD card: Media/TV  —  then press A")
 	} else {
-		tv.tune(tv.cur, true, false)
+		tv.home(true)
 	}
 
 	tick := time.NewTicker(time.Second)
@@ -257,24 +363,51 @@ func (tv *TV) Run() {
 			if !tv.player.Current(ev) {
 				continue
 			}
-			if tv.menuPending(250 * time.Millisecond) {
-				// ffplay quits on MENU by itself; that's our cue too
+			// ffplay quits on MENU by itself; see whether that's why
+			menu := tv.menuPending(250 * time.Millisecond)
+			if tv.mode == modeDVRPlay {
+				tv.onDVREnded(ev, menu)
+				continue
+			}
+			if menu {
 				tv.powerOff()
 				return
 			}
-			tv.onVideoEnded(ev)
+			tv.onSegmentEnded(ev)
 		case now := <-tick.C:
-			// the whole app was paused (Onion sleep) → back on schedule
-			if now.Sub(tv.lastTick) > 4*time.Second && tv.mode == modeWatch && tv.cfg.Live {
-				log.Printf("woke after %v; retuning", now.Sub(tv.lastTick).Round(time.Second))
-				tv.tune(tv.cur, true, false)
+			gap := now.Sub(tv.lastTick)
+			tv.lastTick = now
+			if gap > 4*time.Second {
+				// the whole app was paused (Onion sleep)
+				log.Printf("woke after %v", gap.Round(time.Second))
+				switch tv.mode {
+				case modeWatch:
+					tv.tune(tv.cur, true, false) // back on schedule
+				case modeDVRPlay:
+					tv.dvr.track.skip(gap)
+				}
 			}
-			tv.lastTick = time.Now()
-			if tv.mode == modeGuide {
+			switch tv.mode {
+			case modeGuide:
 				tv.drawGuide()
+			case modeDVR:
+				tv.drawDVR()
 			}
 		}
 	}
+}
+
+// home shows the starting screen of the current mode.
+func (tv *TV) home(snow bool) {
+	if len(tv.chans) == 0 {
+		tv.showEmpty("NO CHANNELS", "Put videos (or folders of episodes) in", "SD card: Media/TV  —  then press A")
+		return
+	}
+	if tv.cfg.Mode == ModeDVR {
+		tv.openDVR()
+		return
+	}
+	tv.tune(tv.cur, snow, false)
 }
 
 // menuPending waits briefly for a MENU press that may be racing ffplay's exit.
@@ -283,9 +416,10 @@ func (tv *TV) menuPending(d time.Duration) bool {
 	for {
 		select {
 		case k := <-tv.keys:
-			if k == BtnMenu {
+			if k&^keyRepeat == BtnMenu {
 				return true
 			}
+			tv.pending = append(tv.pending, k)
 		case <-deadline:
 			return false
 		}
@@ -302,6 +436,18 @@ func (tv *TV) saveState() {
 
 // handleKey returns true when it's time to switch off.
 func (tv *TV) handleKey(k int) bool {
+	if tv.mode == modeDVRPlay {
+		// FFplay has the buttons; we only follow along
+		if k&^keyRepeat == BtnMenu {
+			tv.player.Stop()
+			tv.dvr.stopPlaying(false)
+			tv.openDVR()
+			return false
+		}
+		tv.dvr.track.key(k)
+		return false
+	}
+	k &^= keyRepeat
 	if k == BtnMenu {
 		return true
 	}
@@ -310,10 +456,15 @@ func (tv *TV) handleKey(k int) bool {
 		if k == BtnA || k == BtnStart {
 			tv.rescan()
 			if len(tv.chans) > 0 && tv.problem == "" {
-				tv.cur = 0
-				tv.tune(0, true, false)
+				tv.home(true)
 			}
 		}
+	case modeMenu:
+		if tv.menu.key(k) {
+			tv.closeMenu()
+			return false
+		}
+		tv.drawMenu()
 	case modeGuide:
 		switch k {
 		case BtnUp:
@@ -324,14 +475,32 @@ func (tv *TV) handleKey(k int) bool {
 			tv.guide.Sel = max(0, tv.guide.Sel-guideRows)
 		case BtnR1, BtnRight:
 			tv.guide.Sel = min(len(tv.chans)-1, tv.guide.Sel+guideRows)
-		case BtnA, BtnStart:
+		case BtnA:
 			tv.switchTo(tv.guide.Sel)
 			return false
 		case BtnB, BtnSelect:
 			tv.tune(tv.cur, true, false)
 			return false
+		case BtnStart:
+			tv.openMenu()
+			return false
 		}
 		tv.drawGuide()
+	case modeDVR:
+		switch tv.dvr.browserKey(k) {
+		case dvrPlay:
+			tv.playDVR(tv.dvr.selected(), false)
+		case dvrPlayFromStart:
+			tv.playDVR(tv.dvr.selected(), true)
+		case dvrLive:
+			tv.cfg.Mode = ModeLive
+			saveConfig(tv.configPath(), tv.cfg)
+			tv.tune(tv.cur, true, false)
+		case dvrMenu:
+			tv.openMenu()
+		default:
+			tv.drawDVR()
+		}
 	default: // watching or no signal
 		switch k {
 		case BtnUp, BtnR1, BtnRight, BtnDown, BtnL1, BtnLeft:
@@ -341,12 +510,12 @@ func (tv *TV) handleKey(k int) bool {
 			tv.switchTo(((tv.cur+step)%n + n) % n)
 		case BtnB:
 			tv.switchTo(tv.prev) // "recall": the last channel you were on
-		case BtnSelect, BtnStart:
+		case BtnSelect:
 			tv.openGuide()
+		case BtnStart:
+			tv.openMenu()
 		case BtnA, BtnX, BtnY:
 			tv.tune(tv.cur, false, true) // DISPLAY
-		case BtnL2, BtnR2:
-			// ffplay ignores these; nothing to undo
 		}
 	}
 	return false
@@ -368,7 +537,7 @@ func (tv *TV) collectSteps(step int) int {
 	for {
 		select {
 		case k := <-tv.keys:
-			if s := chanStep(k); s != 0 {
+			if s := chanStep(k &^ keyRepeat); s != 0 {
 				step += s
 				continue
 			}
@@ -392,7 +561,7 @@ func (tv *TV) switchTo(i int) {
 	tv.saveState()
 }
 
-// tune starts channel i at whatever is "on air" now.
+// tune starts channel i at whatever is on the air now.
 func (tv *TV) tune(i int, withSnow, withInfo bool) {
 	if len(tv.chans) == 0 {
 		return
@@ -400,21 +569,29 @@ func (tv *TV) tune(i int, withSnow, withInfo bool) {
 	tv.player.Stop()
 	tv.mode = modeWatch
 	ch := tv.chans[i]
-	idx, off := 0, 0.0
-	if tv.cfg.Live {
-		idx, off = ch.At(time.Now())
-		// too close to the end to be worth starting: go to what's next
-		if it := ch.Items[idx]; it.Dur > 0 && it.Dur-off < 3 {
-			idx, off = (idx+1)%len(ch.Items), 0
-		}
+	si, off := ch.At(time.Now())
+	// too close to the end to be worth starting: go to what's next
+	if s := ch.Segs[si]; !s.Open && s.Len-off < 2 {
+		si, off = (si+1)%len(ch.Segs), 0
 	}
-	tv.start(ch, idx, off, withSnow, true, withInfo)
+	tv.start(ch, si, off, withSnow, true, withInfo)
 }
 
-// start launches one item, showing snow (while ffplay loads) and the OSD.
-func (tv *TV) start(ch *Channel, idx int, off float64, withSnow, withOSD, withInfo bool) {
-	tv.curItem = idx
-	it := ch.Items[idx]
+// start plays part of segment si from off seconds into it, showing snow
+// (while ffplay loads) and the channel number.
+func (tv *TV) start(ch *Channel, si int, off float64, withSnow, withOSD, withInfo bool) {
+	tv.curSeg = si
+	seg := ch.Segs[si]
+	it := seg.Item
+	ss := seg.From + off
+	limit := 0.0
+	if !seg.Open && !seg.Ad && seg.From+seg.Len < it.Dur-0.5 {
+		limit = seg.Len - off // a break is due before the file ends
+	}
+	tv.segLimit = limit
+	if limit == 0 && !seg.Open {
+		tv.segLimit = seg.Len - off
+	}
 	osd := ""
 	if withOSD {
 		w, h := it.W, it.H
@@ -422,16 +599,16 @@ func (tv *TV) start(ch *Channel, idx int, off float64, withSnow, withOSD, withIn
 			w, h = 320, 240
 		}
 		var info *Airing
+		note := ""
 		if withInfo {
-			if air := ch.Upcoming(time.Now(), 1); len(air) > 0 && tv.cfg.Live {
+			if air := ch.Upcoming(time.Now(), 1); len(air) > 0 {
 				info = &air[0]
-			} else {
-				a := Airing{Item: it, Start: time.Now().Add(-time.Duration(off * float64(time.Second)))}
-				a.End = a.Start.Add(time.Duration(it.slot() * float64(time.Second)))
-				info = &a
+			}
+			if seg.Ad {
+				note = "COMMERCIAL BREAK  BACK IN " + fmtClock(ch.AdBreakLeft(si, off))
 			}
 		}
-		img := RenderOSD(tv.fonts, w, h, ch, info, time.Now())
+		img := RenderOSD(tv.fonts, w, h, ch, info, note, time.Now())
 		osd = filepath.Join(tv.player.Work, fmt.Sprintf("osd%d.png", time.Now().UnixNano()%2))
 		if err := writePNG(osd, img); err != nil {
 			log.Printf("osd: %v", err)
@@ -443,8 +620,8 @@ func (tv *TV) start(ch *Channel, idx int, off float64, withSnow, withOSD, withIn
 		secs += 2
 	}
 	// ffplay's clock starts at the keyframe before the seek point
-	from, to := off-2, off+secs
-	if err := tv.player.Play(it.Path, off, osd, from, to); err != nil {
+	from, to := ss-2, ss+secs
+	if err := tv.player.Play(it.Path, ss, limit, osd, from, to); err != nil {
 		tv.noSignal(ch, err.Error())
 		return
 	}
@@ -461,12 +638,19 @@ func (tv *TV) start(ch *Channel, idx int, off float64, withSnow, withOSD, withIn
 	}
 }
 
-func (tv *TV) onVideoEnded(ev exitEvent) {
+// onSegmentEnded moves on when a show part or commercial finishes.
+func (tv *TV) onSegmentEnded(ev exitEvent) {
 	ch := tv.chans[tv.cur]
+	seg := ch.Segs[tv.curSeg]
 	ran := time.Since(ev.started)
-	if ran < 2500*time.Millisecond {
+	n := len(ch.Segs)
+	if ran < 2500*time.Millisecond && (seg.Open || tv.segLimit > 4) {
 		tv.fails++
 		log.Printf("ffplay ended after %v (%v); failure %d", ran.Round(time.Millisecond), ev.err, tv.fails)
+		if seg.Ad && tv.fails < 6 {
+			tv.start(ch, (tv.curSeg+1)%n, 0, false, false, false) // skip a bad commercial
+			return
+		}
 		if tv.fails >= 3 {
 			why := "This video won't play. Convert it with vhsify."
 			if b, err := os.ReadFile(filepath.Join(tv.player.Work, "ffplay.log")); err == nil && len(b) > 0 {
@@ -476,21 +660,23 @@ func (tv *TV) onVideoEnded(ev exitEvent) {
 			tv.noSignal(ch, why)
 			return
 		}
-	} else {
-		tv.fails = 0
+		tv.start(ch, tv.curSeg, 0, false, false, false) // retry from the top of the part
+		return
 	}
-	// the programme ended: on to the next one, no snow, no OSD
-	next := (tv.curItem + 1) % len(ch.Items)
-	off := 0.0
-	if tv.cfg.Live {
-		if idx, o := ch.At(time.Now()); idx == next && ch.Items[idx].Dur-o > 3 {
-			off = o
+	tv.fails = 0
+	next := (tv.curSeg + 1) % n
+	si, off := ch.At(time.Now())
+	switch {
+	case si == tv.curSeg && (seg.Open || seg.Len-off < 20), si == next && off < 20:
+		// on time (or a little behind): carry straight on
+		tv.start(ch, next, 0, false, false, false)
+	default:
+		// we drifted (a video longer or shorter than its file says): rejoin
+		if s := ch.Segs[si]; !s.Open && s.Len-off < 2 {
+			si, off = (si+1)%n, 0
 		}
+		tv.start(ch, si, off, false, false, false)
 	}
-	if tv.fails > 0 {
-		next, off = tv.curItem, 0 // retry the same item from the top
-	}
-	tv.start(ch, next, off, false, false, false)
 }
 
 func (tv *TV) noSignal(ch *Channel, why string) {
@@ -521,6 +707,115 @@ func (tv *TV) drawGuide() {
 	tv.present()
 }
 
+// ---------- setup menu ----------
+
+func (tv *TV) openMenu() {
+	tv.player.Stop()
+	tv.mode = modeMenu
+	tv.menu.open(tv.cfg, tv.adsFound())
+	tv.drawMenu()
+}
+
+func (tv *TV) drawMenu() {
+	DrawMenu(tv.canvas, tv.fonts, &tv.menu)
+	tv.present()
+}
+
+func (tv *TV) closeMenu() {
+	old := tv.cfg
+	tv.cfg = tv.menu.apply(tv.cfg)
+	if tv.cfg != old {
+		saveConfig(tv.configPath(), tv.cfg)
+		if tv.cfg.Order != old.Order {
+			tv.rescan()
+		} else if tv.cfg.adOptions() != old.adOptions() {
+			for _, c := range tv.chans {
+				c.Build(tv.cfg.adOptions())
+			}
+		}
+	}
+	tv.home(true)
+}
+
+// ---------- DVR ----------
+
+func (tv *TV) openDVR() {
+	tv.player.Stop()
+	tv.mode = modeDVR
+	tv.drawDVR()
+}
+
+func (tv *TV) drawDVR() {
+	DrawDVR(tv.canvas, tv.fonts, tv.dvr, time.Now())
+	tv.present()
+}
+
+func (tv *TV) playDVR(n *Node, fromStart bool) {
+	if n == nil || n.Item == nil {
+		tv.drawDVR()
+		return
+	}
+	it := n.Item
+	ss := 0.0
+	if !fromStart {
+		ss = tv.dvr.resumeAt(it)
+	}
+	tv.player.Stop()
+	w, h := it.W, it.H
+	if w <= 0 || h <= 0 {
+		w, h = 320, 240
+	}
+	osd := filepath.Join(tv.player.Work, fmt.Sprintf("osd%d.png", time.Now().UnixNano()%2))
+	if err := writePNG(osd, RenderPlayOSD(tv.fonts, w, h, it.Label(), ss)); err != nil {
+		osd = ""
+	}
+	if err := tv.player.Play(it.Path, ss, 0, osd, ss-2, ss+tv.cfg.OSDSeconds+1); err != nil {
+		tv.dvr.message = err.Error()
+		tv.openDVR()
+		return
+	}
+	tv.mode = modeDVRPlay
+	tv.dvr.startPlaying(n, ss)
+	tv.canvas.Fill(0, 0, tv.canvas.W, tv.canvas.H, colBlack)
+	tv.present()
+}
+
+func (tv *TV) onDVREnded(ev exitEvent, menu bool) {
+	if menu {
+		tv.dvr.stopPlaying(false)
+		tv.openDVR()
+		return
+	}
+	n := tv.dvr.playing
+	if time.Since(ev.started) < 2500*time.Millisecond {
+		tv.dvr.stopPlaying(false)
+		tv.dvr.message = "That video wouldn't play. Convert it with vhsify."
+		tv.openDVR()
+		return
+	}
+	tv.dvr.stopPlaying(true) // reached the end: watched
+	next := tv.dvr.nextAfter(n)
+	if next == nil {
+		tv.openDVR()
+		return
+	}
+	// a moment to see what's coming, then keep watching
+	tv.dvr.focus(next)
+	DrawUpNext(tv.canvas, tv.fonts, next.Item.Label())
+	tv.present()
+	select {
+	case k := <-tv.keys:
+		if k&^keyRepeat == BtnB || k&^keyRepeat == BtnMenu {
+			tv.openDVR()
+			return
+		}
+	case <-time.After(2500 * time.Millisecond):
+	}
+	tv.playDVR(next, false)
+}
+
+// ---------- power ----------
+
 func (tv *TV) powerOn() {
 	under := NewCanvas(tv.canvas.W, tv.canvas.H)
 	tv.snow.Draw(under)
@@ -538,10 +833,13 @@ func (tv *TV) powerOn() {
 
 func (tv *TV) powerOff() {
 	last := NewCanvas(tv.canvas.W, tv.canvas.H)
-	if tv.mode == modeWatch {
-		tv.fb.Capture(last)
+	if tv.mode == modeWatch || tv.mode == modeDVRPlay {
+		tv.fb.CaptureFit(last)
 	} else {
 		copy(last.Pix, tv.canvas.Pix)
+	}
+	if tv.mode == modeDVRPlay {
+		tv.dvr.stopPlaying(false)
 	}
 	tv.player.Stop()
 	tv.saveState()

@@ -10,27 +10,38 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"strings"
 	"time"
 )
 
 func demoChannels() []*Channel {
-	mk := func(num int, name string, items ...string) *Channel {
-		c := &Channel{Num: num, Name: name, Key: name, Seed: float64(num * 977)}
-		for i, t := range items {
-			d := 22*60.0 + float64(i%3)*60
-			if len(items) == 1 {
-				d = 104 * 60
+	ads := []*Item{}
+	for i, t := range []string{"Crystal Pepsi", "Nintendo 64 - Get N or Get Out", "Gushers", "Sega Genesis Does", "Dunkaroos"} {
+		ads = append(ads, &Item{Title: t, Rel: t + ".mp4", Dur: 30 + float64(i%2)*15, W: 320, H: 240})
+	}
+	mk := func(num int, name string, shows ...string) *Channel {
+		c := &Channel{Num: num, Name: name, Key: name, Dir: "/demo/" + name, Ads: ads}
+		if len(shows) == 1 {
+			c.Dir = ""
+			c.Items = []*Item{{Title: shows[0], Rel: shows[0] + ".mp4", Path: "/demo/" + shows[0] + ".mp4", Dur: 104 * 60, W: 320, H: 240}}
+		} else {
+			eps := []string{"Pilot", "The Big Game", "Snow Day", "Field Trip"}
+			for _, show := range shows {
+				for e, t := range eps {
+					c.Items = append(c.Items, &Item{Show: show, Title: fmt.Sprintf("S1E%d %s", e+1, t), Rel: fmt.Sprintf("%s/Season 1/S1E%d %s.mp4", show, e+1, t), Path: fmt.Sprintf("/demo/%s/%s/Season 1/S1E%d %s.mp4", name, show, e+1, t), Dur: 22*60 + float64(e%3)*60, W: 320, H: 240})
+				}
 			}
-			c.Items = append(c.Items, &Item{Title: t, Dur: d, W: 320, H: 240})
-			c.Total += d
+			c.Items = arrange(c.Items, OrderRotate, c.Key)
 		}
+		c.Seed = float64(num * 977)
+		c.Build(AdOptions{On: true, EveryMin: 8, PerBreak: 3})
 		return c
 	}
 	return []*Channel{
-		mk(2, "Saturday Cartoons", "Rocko's Modern Life", "Doug", "Rugrats", "Ren & Stimpy"),
+		mk(2, "Saturday Cartoons", "Rocko's Modern Life", "Doug", "Rugrats"),
 		mk(3, "Back to the Future", "Back to the Future"),
-		mk(4, "Home Videos", "Christmas 1994", "Beach Trip 1996", "Talent Show"),
-		mk(5, "Nature Hour", "Big Buck Bunny", "Desert Life", "Ocean Deep"),
+		mk(4, "Home Videos", "Christmas 1994", "Beach Trip 1996"),
+		mk(5, "Nature Hour", "Big Buck Bunny", "Ocean Deep"),
 		mk(7, "Sitcom Night", "Family Matters", "Full House", "Step by Step"),
 		mk(9, "Late Movie", "The Goonies"),
 		mk(11, "Music Videos", "Top 20 Countdown", "Alt Rock Block"),
@@ -85,7 +96,41 @@ func renderShot(name string) error {
 			a := chans[3].Upcoming(now, 1)[0]
 			info = &a
 		}
-		overlayNRGBA(c, RenderOSD(fonts, 320, 240, chans[3], info, now))
+		overlayNRGBA(c, RenderOSD(fonts, 320, 240, chans[3], info, "", now))
+	case "ad":
+		shotBackground(c)
+		a := chans[0].Upcoming(now, 1)[0]
+		overlayNRGBA(c, RenderOSD(fonts, 320, 240, chans[0], &a, "COMMERCIAL BREAK  BACK IN 1:15", now))
+	case "play":
+		shotBackground(c)
+		overlayNRGBA(c, RenderPlayOSD(fonts, 320, 240, "Rugrats - S1E3 Snow Day", 754))
+	case "menu":
+		m := &Menu{}
+		m.open(defaultConfig(), 14)
+		m.Sel = rowAds
+		DrawMenu(c, fonts, m)
+	case "dvr", "dvr2":
+		d := newDVR("")
+		d.setLineup("/demo", chans)
+		it := chans[0].Items
+		for _, x := range it {
+			if x.Show == "Doug" && strings.Contains(x.Title, "E1 ") {
+				d.marks[d.key(x)] = Mark{Done: true}
+			}
+			if x.Show == "Doug" && strings.Contains(x.Title, "E2 ") {
+				d.marks[d.key(x)] = Mark{Pos: 600}
+			}
+		}
+		if name == "dvr2" {
+			d.browserKey(BtnA) // Saturday Cartoons
+			d.browserKey(BtnA) // Doug
+			d.browserKey(BtnA) // Season 1
+			d.browserKey(BtnDown)
+			d.browserKey(BtnDown)
+		}
+		DrawDVR(c, fonts, d, now)
+	case "upnext":
+		DrawUpNext(c, fonts, "Rugrats - S1E4 Field Trip")
 	case "guide":
 		g := &Guide{Sel: 1}
 		DrawGuide(c, fonts, chans, g, now, 3)

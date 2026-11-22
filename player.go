@@ -68,12 +68,17 @@ func ffEscape(s string) string {
 	return r.Replace(s)
 }
 
-func (p *Player) Play(path string, ss float64, osd string, osdFrom, osdTo float64) error {
+// Play starts path at ss seconds. limit > 0 stops it after that many
+// seconds (a commercial break is due); FFplay then exits by itself.
+func (p *Player) Play(path string, ss, limit float64, osd string, osdFrom, osdTo float64) error {
 	p.Stop()
 	os.Remove(filepath.Join(p.Work, "pos.cfg"))
 	args := []string{"-autoexit", "-loglevel", p.LogLvl}
 	if ss > 0.05 {
 		args = append(args, "-ss", fmt.Sprintf("%.2f", ss))
+	}
+	if limit > 0 {
+		args = append(args, "-t", fmt.Sprintf("%.2f", limit))
 	}
 	args = append(args, "-vf", p.filterGraph(osd, osdFrom, osdTo), "-i", path)
 	cmd := exec.Command(p.Bin, args...)
@@ -91,7 +96,7 @@ func (p *Player) Play(path string, ss float64, osd string, osdFrom, osdTo float6
 	p.cmd = cmd
 	p.running = true
 	gen, started := p.gen, time.Now()
-	log.Printf("play %q from %.1fs (pid %d)", path, ss, cmd.Process.Pid)
+	log.Printf("play %q from %.1fs for %.1fs (pid %d)", path, ss, limit, cmd.Process.Pid)
 	go func() {
 		err := cmd.Wait()
 		p.Exited <- exitEvent{gen: gen, started: started, err: err}

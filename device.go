@@ -24,6 +24,7 @@ type Framebuffer struct {
 	W, H   int
 	stride int
 	flip   bool
+	scaled *Canvas // PresentFit's buffer
 }
 
 func ioctl(fd uintptr, req uintptr, p unsafe.Pointer) error {
@@ -149,6 +150,9 @@ const (
 	BtnRight  = 106
 	BtnDown   = 108
 	BtnPower  = 116
+
+	// keyRepeat marks an auto-repeat of a held button
+	keyRepeat = 1 << 16
 )
 
 // ReadInput streams key presses (and auto-repeat for the d-pad and shoulders).
@@ -177,6 +181,9 @@ func ReadInput(path string, out chan<- int) error {
 			}
 			repeatable := code == BtnUp || code == BtnDown || code == BtnLeft || code == BtnRight || code == BtnL1 || code == BtnR1
 			if val == 1 || (val == 2 && repeatable) {
+				if val == 2 {
+					code |= keyRepeat
+				}
 				select {
 				case out <- code:
 				default:

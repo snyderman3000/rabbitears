@@ -2,20 +2,30 @@ package main
 
 // The channel lineup and the "live broadcast" schedule.
 //
-// Media/TV/<file>          → one channel that loops that video
-// Media/TV/<folder>/...    → one channel that airs every video in the folder
-//                            (sub-folders included) in order, then repeats
+// Media/TV/<file>              → a channel that loops that video
+// Media/TV/<folder>/...        → a channel that airs the videos inside
+// Media/TV/<folder>/<show>/... → each show folder is one show; the channel
+//                                rotates between shows one episode at a time
+//                                (Show A ep 1, Show B ep 1, Show A ep 2 ...).
+//                                Seasons inside a show stay in order.
+// Media/TV/Commercials/...     → commercials played in breaks. A sub-folder
+//                                named after a channel holds that channel's
+//                                own commercials.
 // A leading number ("07 MTV", "12 - Cartoons") picks the channel number.
+// An order.txt in a channel folder (rotate, in order or shuffle) overrides
+// the show order set in the menu for that channel.
 //
 // Every channel is always "on air": where you land when you tune in is worked
 // out from the clock, so flipping away and back skips ahead the way real TV
-// did, and every Rabbit Ears in the world shows the same thing at once.
+// did. Commercial breaks are part of that timetable, so the guide's times
+// stay right and every viewer sees the same break.
 
 import (
 	"encoding/binary"
 	"encoding/json"
 	"hash/fnv"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,14 +43,23 @@ var videoExts = map[string]bool{
 }
 
 // unknownDur is what a video we can't read the length of counts as in the
-// schedule (it still always plays from its start).
+// schedule (it always plays from its start, with no breaks inside it).
 const unknownDur = 30 * 60.0
+
+// commercialsDir is the folder name (any case) that holds commercials.
+const commercialsDir = "commercials"
+
+// maxAdLen: longer videos in Commercials are skipped (someone dropped an
+// episode in there by mistake).
+const maxAdLen = 5 * 60.0
 
 type Item struct {
 	Path  string
+	Rel   string // path inside its channel folder (for sorting and the DVR)
 	Title string
-	Dur   float64 // seconds; 0 = unknown
-	W, H  int     // video size; 0 = unknown
+	Show  string // show folder name, "" for loose videos
+	Dur   float64
+	W, H  int
 }
 
 func (it *Item) slot() float64 {
@@ -50,55 +69,257 @@ func (it *Item) slot() float64 {
 	return unknownDur
 }
 
+// Label is the title as shown in the guide: "Show - Episode" when the
+// episode's own name doesn't already say which show it is.
+func (it *Item) Label() string {
+	if it.Show == "" || strings.Contains(norm(it.Title), norm(it.Show)) {
+		return it.Title
+	}
+	return it.Show + " - " + it.Title
+}
+
+// Order of episodes on a channel.
+const (
+	OrderRotate     = "rotate"
+	OrderSequential = "in order"
+	OrderShuffle    = "shuffle"
+)
+
+func parseOrder(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "rotate", "rotation", "round robin", "mix":
+		return OrderRotate
+	case "in order", "sequential", "order", "chronological", "inorder", "in-order":
+		return OrderSequential
+	case "shuffle", "random", "randomize", "shuffled":
+		return OrderShuffle
+	}
+	return ""
+}
+
+// Seg is one stretch of air time: part of an episode, or one commercial.
+type Seg struct {
+	Item   *Item
+	From   float64 // where in the file it starts
+	Len    float64 // how long it airs
+	Start  float64 // offset in the channel's cycle
+	Ad     bool
+	Open   bool // length unknown: play the file to its end, no -t
+	Block  int  // which episode block it belongs to
+	LastAd bool // last commercial of its break
+}
+
+// Block is one episode with the break before it and the breaks inside it,
+// which is what the guide lists.
+type Block struct {
+	Item  *Item
+	Start float64
+	Len   float64
+	First int // first segment
+}
+
 type Channel struct {
-	Num   int
-	Name  string
-	Key   string // path relative to the TV folder; stable across renumbering
-	Items []*Item
-	Total float64
-	Seed  float64
-}
-
-// At returns which item is on the air at t and how far into it.
-func (c *Channel) At(t time.Time) (int, float64) {
-	if len(c.Items) == 0 || c.Total <= 0 {
-		return 0, 0
-	}
-	now := float64(t.UnixNano())/1e9 + c.Seed
-	p := now - c.Total*float64(int64(now/c.Total))
-	for i, it := range c.Items {
-		if p < it.slot() {
-			if it.Dur <= 0 {
-				return i, 0
-			}
-			return i, p
-		}
-		p -= it.slot()
-	}
-	return len(c.Items) - 1, 0
-}
-
-// Next returns when item i (as scheduled at t) ends and what comes after it.
-func (c *Channel) Upcoming(t time.Time, n int) []Airing {
-	if len(c.Items) == 0 {
-		return nil
-	}
-	i, off := c.At(t)
-	start := t.Add(-time.Duration(off * float64(time.Second)))
-	var out []Airing
-	for k := 0; k < n; k++ {
-		it := c.Items[i]
-		end := start.Add(time.Duration(it.slot() * float64(time.Second)))
-		out = append(out, Airing{Item: it, Start: start, End: end})
-		start = end
-		i = (i + 1) % len(c.Items)
-	}
-	return out
+	Num    int
+	Name   string
+	Key    string // name in the TV folder; stable across renumbering
+	Dir    string // the channel folder ("" for a single-file channel)
+	Order  string // the order this channel actually uses
+	Items  []*Item
+	Seed   float64
+	Total  float64
+	Segs   []Seg
+	Blocks []Block
+	Ads    []*Item // the commercials this channel draws from
 }
 
 type Airing struct {
 	Item       *Item
 	Start, End time.Time
+}
+
+// At returns which segment is on the air at t and how far into it.
+func (c *Channel) At(t time.Time) (int, float64) {
+	if len(c.Segs) == 0 || c.Total <= 0 {
+		return 0, 0
+	}
+	now := float64(t.UnixNano())/1e9 + c.Seed
+	p := now - c.Total*math.Floor(now/c.Total)
+	i := sort.Search(len(c.Segs), func(i int) bool { return c.Segs[i].Start > p }) - 1
+	if i < 0 {
+		i = 0
+	}
+	off := p - c.Segs[i].Start
+	if c.Segs[i].Open {
+		off = 0
+	}
+	return i, off
+}
+
+// Upcoming lists the episode on now and the ones after it.
+func (c *Channel) Upcoming(t time.Time, n int) []Airing {
+	if len(c.Blocks) == 0 {
+		return nil
+	}
+	si, off := c.At(t)
+	seg := c.Segs[si]
+	b := seg.Block
+	into := seg.Start + off - c.Blocks[b].Start
+	start := t.Add(-time.Duration(into * float64(time.Second)))
+	var out []Airing
+	for k := 0; k < n; k++ {
+		bl := c.Blocks[b]
+		end := start.Add(time.Duration(bl.Len * float64(time.Second)))
+		out = append(out, Airing{Item: bl.Item, Start: start, End: end})
+		start = end
+		b = (b + 1) % len(c.Blocks)
+	}
+	return out
+}
+
+// AdBreakLeft: when segment si is a commercial, how long until the show
+// comes back.
+func (c *Channel) AdBreakLeft(si int, off float64) float64 {
+	left := 0.0
+	for i := si; i < len(c.Segs) && c.Segs[i].Ad; i++ {
+		left += c.Segs[i].Len
+	}
+	return left - off
+}
+
+// ---------- the schedule ----------
+
+type AdOptions struct {
+	On       bool
+	EveryMin float64 // mid-episode break interval; 0 = only between episodes
+	PerBreak int
+}
+
+// breakPoints: where an episode of length d is interrupted. Never in the
+// first or last few minutes.
+func breakPoints(d, every float64) []float64 {
+	if every <= 0 || d <= 0 {
+		return nil
+	}
+	var out []float64
+	for p := every; p <= d-3*60; p += every {
+		out = append(out, p)
+	}
+	return out
+}
+
+func rng(seed uint64) func() uint64 {
+	s := seed*0x9E3779B97F4A7C15 + 0x632BE59BD9B4E019
+	return func() uint64 {
+		s ^= s >> 12
+		s ^= s << 25
+		s ^= s >> 27
+		return s * 2685821657736338717
+	}
+}
+
+// Build lays out the channel's cycle: every episode in order, with a
+// commercial break before it and at its break points.
+func (c *Channel) Build(ads AdOptions) {
+	c.Segs, c.Blocks = nil, nil
+	pool := c.Ads
+	useAds := ads.On && len(pool) > 0 && ads.PerBreak > 0
+	nb := uint64(0)
+	h := fnv.New64a()
+	h.Write([]byte(c.Key))
+	base := h.Sum64()
+	addBreak := func(block int) {
+		next := rng(base ^ (nb+1)*0xA24BAED4963EE407)
+		nb++
+		n := ads.PerBreak
+		if n > len(pool) {
+			n = len(pool)
+		}
+		used := map[int]bool{}
+		for k := 0; k < n; k++ {
+			j := int(next() % uint64(len(pool)))
+			for used[j] {
+				j = (j + 1) % len(pool)
+			}
+			used[j] = true
+			c.Segs = append(c.Segs, Seg{Item: pool[j], Len: pool[j].Dur, Ad: true, Block: block, LastAd: k == n-1})
+		}
+	}
+	for _, it := range c.Items {
+		b := len(c.Blocks)
+		c.Blocks = append(c.Blocks, Block{Item: it, First: len(c.Segs)})
+		if useAds {
+			addBreak(b)
+		}
+		if it.Dur <= 0 {
+			c.Segs = append(c.Segs, Seg{Item: it, Len: unknownDur, Open: true, Block: b})
+			continue
+		}
+		from := 0.0
+		if useAds {
+			for _, p := range breakPoints(it.Dur, ads.EveryMin*60) {
+				c.Segs = append(c.Segs, Seg{Item: it, From: from, Len: p - from, Block: b})
+				addBreak(b)
+				from = p
+			}
+		}
+		c.Segs = append(c.Segs, Seg{Item: it, From: from, Len: it.Dur - from, Block: b})
+	}
+	t := 0.0
+	for i := range c.Segs {
+		c.Segs[i].Start = t
+		t += c.Segs[i].Len
+	}
+	for i := range c.Blocks {
+		c.Blocks[i].Start = c.Segs[c.Blocks[i].First].Start
+		end := t
+		if i+1 < len(c.Blocks) {
+			end = c.Segs[c.Blocks[i+1].First].Start
+		}
+		c.Blocks[i].Len = end - c.Blocks[i].Start
+	}
+	c.Total = t
+}
+
+// arrange puts a channel's videos in airing order.
+func arrange(items []*Item, order string, key string) []*Item {
+	sort.SliceStable(items, func(i, j int) bool { return natLess(items[i].Rel, items[j].Rel) })
+	switch order {
+	case OrderShuffle:
+		h := fnv.New64a()
+		h.Write([]byte(key))
+		next := rng(h.Sum64())
+		out := append([]*Item(nil), items...)
+		for i := len(out) - 1; i > 0; i-- {
+			j := int(next() % uint64(i+1))
+			out[i], out[j] = out[j], out[i]
+		}
+		return out
+	case OrderRotate:
+		var groups [][]*Item
+		idx := map[string]int{}
+		for _, it := range items {
+			g, ok := idx[it.Show]
+			if !ok {
+				g = len(groups)
+				idx[it.Show] = g
+				groups = append(groups, nil)
+			}
+			groups[g] = append(groups[g], it)
+		}
+		if len(groups) < 2 {
+			return items
+		}
+		var out []*Item
+		for k := 0; len(out) < len(items); k++ {
+			for _, g := range groups {
+				if k < len(g) {
+					out = append(out, g[k])
+				}
+			}
+		}
+		return out
+	}
+	return items
 }
 
 // ---------- scanning ----------
@@ -114,6 +335,10 @@ func cleanTitle(name string) string {
 	return strings.Join(strings.Fields(name), " ")
 }
 
+func cleanFolder(name string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(name, "_", " ")), " ")
+}
+
 func splitNumber(name string) (int, string) {
 	if m := numPrefix.FindStringSubmatch(name); m != nil {
 		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 && n < 1000 {
@@ -121,6 +346,168 @@ func splitNumber(name string) (int, string) {
 		}
 	}
 	return 0, name
+}
+
+var nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
+
+// norm makes names comparable: "07 - G4_TV" and "g4 tv" both become "g4tv".
+func norm(s string) string {
+	_, s = splitNumber(s)
+	s = strings.TrimSuffix(s, filepath.Ext(s))
+	return nonAlnum.ReplaceAllString(strings.ToLower(s), "")
+}
+
+// collect lists the videos under dir (any depth) with their show folder.
+func collect(dir string, cache *durCache) []*Item {
+	var items []*Item
+	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") && p != dir {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() || !isVideo(d.Name()) {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, p)
+		rel = filepath.ToSlash(rel)
+		it := &Item{Path: p, Rel: rel}
+		if i := strings.IndexByte(rel, '/'); i > 0 {
+			_, show := splitNumber(rel[:i])
+			it.Show = cleanFolder(show)
+		}
+		_, t := splitNumber(filepath.Base(p))
+		it.Title = cleanTitle(t)
+		it.Dur, it.W, it.H = cache.probe(p)
+		items = append(items, it)
+		return nil
+	})
+	return items
+}
+
+type ScanOptions struct {
+	First int
+	Order string // default order; order.txt in a channel folder wins
+}
+
+// Scan builds the lineup from the TV folder, with each channel's commercials
+// attached (call Build to lay out the schedule).
+func Scan(dir string, opt ScanOptions, cache *durCache) []*Channel {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	if opt.Order == "" {
+		opt.Order = OrderRotate
+	}
+	var chans []*Channel
+	var adsGeneral []*Item
+	adsFor := map[string][]*Item{}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		if e.IsDir() && strings.EqualFold(name, commercialsDir) {
+			for _, ad := range collect(full, cache) {
+				if ad.Dur <= 0 || ad.Dur > maxAdLen {
+					continue
+				}
+				if ad.Show != "" {
+					k := norm(strings.SplitN(ad.Rel, "/", 2)[0])
+					adsFor[k] = append(adsFor[k], ad)
+				}
+				adsGeneral = append(adsGeneral, ad)
+			}
+			continue
+		}
+		ch := &Channel{Key: name, Order: opt.Order}
+		var label string
+		if e.IsDir() {
+			ch.Num, label = splitNumber(name)
+			ch.Name = cleanFolder(label)
+			ch.Dir = full
+			ch.Items = collect(full, cache)
+			if b, err := os.ReadFile(filepath.Join(full, "order.txt")); err == nil {
+				if o := parseOrder(string(b)); o != "" {
+					ch.Order = o
+				}
+			}
+		} else if isVideo(name) {
+			ch.Num, label = splitNumber(name)
+			ch.Name = cleanTitle(label)
+			it := &Item{Path: full, Rel: name, Title: ch.Name}
+			it.Dur, it.W, it.H = cache.probe(full)
+			ch.Items = []*Item{it}
+		} else {
+			continue
+		}
+		if len(ch.Items) == 0 {
+			continue
+		}
+		ch.Items = arrange(ch.Items, ch.Order, ch.Key)
+		h := fnv.New32a()
+		h.Write([]byte(ch.Key))
+		ch.Seed = float64(h.Sum32() % 86400)
+		chans = append(chans, ch)
+	}
+	cache.save()
+
+	// commercials: a channel's own folder if it has one, else the general
+	// pool minus other channels' own commercials
+	var shared []*Item
+	owned := map[string]bool{}
+	for _, c := range chans {
+		owned[norm(c.Key)] = true
+		owned[norm(c.Name)] = true
+	}
+	for _, ad := range adsGeneral {
+		if ad.Show != "" && owned[norm(strings.SplitN(ad.Rel, "/", 2)[0])] {
+			continue
+		}
+		shared = append(shared, ad)
+	}
+	sort.SliceStable(shared, func(i, j int) bool { return natLess(shared[i].Rel, shared[j].Rel) })
+	for _, c := range chans {
+		own := adsFor[norm(c.Key)]
+		if len(own) == 0 {
+			own = adsFor[norm(c.Name)]
+		}
+		if len(own) > 0 {
+			c.Ads = own
+		} else {
+			c.Ads = shared
+		}
+	}
+
+	sort.SliceStable(chans, func(i, j int) bool { return natLess(chans[i].Key, chans[j].Key) })
+	taken := map[int]bool{}
+	for _, c := range chans {
+		if c.Num > 0 {
+			if taken[c.Num] {
+				c.Num = 0
+			} else {
+				taken[c.Num] = true
+			}
+		}
+	}
+	n := opt.First
+	for _, c := range chans {
+		if c.Num == 0 {
+			for taken[n] {
+				n++
+			}
+			c.Num = n
+			taken[n] = true
+		}
+	}
+	sort.SliceStable(chans, func(i, j int) bool { return chans[i].Num < chans[j].Num })
+	return chans
 }
 
 type durCache struct {
@@ -166,94 +553,6 @@ func (c *durCache) probe(path string) (float64, int, int) {
 	c.m[path] = cacheEntry{st.Size(), st.ModTime().Unix(), d, w, h}
 	c.dirty = true
 	return d, w, h
-}
-
-// Scan builds the lineup from the TV folder.
-func Scan(dir string, first int, cache *durCache) []*Channel {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	var chans []*Channel
-	for _, e := range entries {
-		name := e.Name()
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-		full := filepath.Join(dir, name)
-		ch := &Channel{Key: name}
-		var label string
-		if e.IsDir() {
-			ch.Num, label = splitNumber(name)
-			filepath.WalkDir(full, func(p string, d os.DirEntry, err error) error {
-				if err != nil {
-					return nil
-				}
-				if strings.HasPrefix(d.Name(), ".") && p != full {
-					if d.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
-				if !d.IsDir() && isVideo(d.Name()) {
-					ch.Items = append(ch.Items, &Item{Path: p})
-				}
-				return nil
-			})
-			sort.Slice(ch.Items, func(i, j int) bool { return natLess(ch.Items[i].Path, ch.Items[j].Path) })
-		} else if isVideo(name) {
-			ch.Num, label = splitNumber(name)
-			ch.Items = []*Item{{Path: full}}
-		} else {
-			continue
-		}
-		if len(ch.Items) == 0 {
-			continue
-		}
-		ch.Name = cleanTitle(label)
-		if e.IsDir() {
-			ch.Name = strings.Join(strings.Fields(strings.ReplaceAll(label, "_", " ")), " ")
-		}
-		for _, it := range ch.Items {
-			it.Dur, it.W, it.H = cache.probe(it.Path)
-			_, t := splitNumber(filepath.Base(it.Path))
-			it.Title = cleanTitle(t)
-			if len(ch.Items) == 1 && !e.IsDir() {
-				it.Title = ch.Name
-			}
-			ch.Total += it.slot()
-		}
-		h := fnv.New32a()
-		h.Write([]byte(ch.Key))
-		ch.Seed = float64(h.Sum32() % 86400)
-		chans = append(chans, ch)
-	}
-	cache.save()
-	sort.SliceStable(chans, func(i, j int) bool { return natLess(chans[i].Key, chans[j].Key) })
-
-	// numbering: explicit numbers win; the rest count up from `first`
-	taken := map[int]bool{}
-	for _, c := range chans {
-		if c.Num > 0 {
-			if taken[c.Num] {
-				c.Num = 0
-			} else {
-				taken[c.Num] = true
-			}
-		}
-	}
-	n := first
-	for _, c := range chans {
-		if c.Num == 0 {
-			for taken[n] {
-				n++
-			}
-			c.Num = n
-			taken[n] = true
-		}
-	}
-	sort.SliceStable(chans, func(i, j int) bool { return chans[i].Num < chans[j].Num })
-	return chans
 }
 
 func isVideo(name string) bool {

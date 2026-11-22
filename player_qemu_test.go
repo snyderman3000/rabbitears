@@ -23,10 +23,10 @@ func TestRealFFplay(t *testing.T) {
 	os.WriteFile(filepath.Join(work, "pos.cfg"), make([]byte, 67320), 0o644)
 	ch := &Channel{Num: 4, Name: "Nature Hour"}
 	osd := filepath.Join(work, "osd0.png")
-	if err := writePNG(osd, RenderOSD(newFonts(), 320, 240, ch, nil, time.Now())); err != nil {
+	if err := writePNG(osd, RenderOSD(newFonts(), 320, 240, ch, nil, "", time.Now())); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Play(vid, 12.5, osd, 10.5, 15.5); err != nil {
+	if err := p.Play(vid, 12.5, 0, osd, 10.5, 15.5); err != nil {
 		t.Fatal(err)
 	}
 	select {

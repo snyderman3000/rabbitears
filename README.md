@@ -21,18 +21,44 @@ It plays through the FFplay that ships with Onion, so there's nothing else to in
 | In `Media/TV` | Becomes |
 |---|---|
 | `Late Movie.mp4` | a channel that loops that video |
-| `Saturday Cartoons/` (any depth) | a channel that airs every video inside in order, then repeats; "Ep 2" sorts before "Ep 10" |
+| `Saturday Cartoons/` | a channel that airs every video inside, then repeats |
+| `Saturday Cartoons/Doug/Season 1/…`, `Saturday Cartoons/Rugrats/…` | show folders: the channel rotates between them one episode at a time (Doug 1, Rugrats 1, Doug 2 …); seasons stay in order, "Ep 2" before "Ep 10" |
 | `07 MTV/` or `12 - Movie.mp4` | the leading number picks the channel; the rest count up from 2 |
+| `Commercials/` | commercials for the breaks (below) |
+
+Show order is set in **SETUP** (START): *rotate shows*, *in order* or *shuffle*. An `order.txt` in a channel folder containing `rotate`, `in order` or `shuffle` overrides it for that channel.
+
+## Commercials
+
+Put old commercials (MP4, up to 5 minutes) in `Media/TV/Commercials`. In live TV they play before every show and in breaks during it. A folder inside `Commercials` named after a channel (`Commercials/G4/`) is just for that channel; the rest are shared. SETUP turns them on or off and sets how often breaks come (every 6–15 minutes, or only between shows) and how many commercials each break has. Breaks are part of the timetable, so the guide's times and "time left" stay right and every viewer sees the same break.
+
+## DVR mode
+
+SETUP → MODE → DVR switches from live channels to on demand: browse channel → show → season → episode and watch anything from the start. Rabbit Ears remembers where you stopped (it follows the same seek and pause buttons Onion's player uses), plays the next episode of the same show when one ends, and marks what you've watched. No commercials in DVR mode.
 
 ## Controls
 
-| Button | |
+| Live TV | |
 |---|---|
 | Up / Down, L / R, Left / Right | change channel |
 | B | previous channel |
-| A | display: channel, show, clock, time left |
-| Select / Start | channel guide |
+| A | display: channel, show, clock, time left (and how long a break has left) |
+| Select | channel guide |
+| Start | SETUP |
 | Menu | turn the TV off |
+
+| DVR list | |
+|---|---|
+| A | open / play (resume) |
+| Y | play from the start |
+| X | mark watched / unwatched (works on folders) |
+| B | back |
+| Select | live TV |
+| Start | SETUP |
+
+While a DVR episode plays, Onion's player has the buttons: Left/Right ±10 s, Up/Down ±1 min, Y/X ±10 min, A pause, Menu stops and goes back to the list.
+
+The screens are drawn at 640×480 and scaled to the panel, so text is the same size on the Mini V4's 750×560 screen.
 
 ## vhsify
 
@@ -54,15 +80,16 @@ Output is 320×240 H.264 baseline with a keyframe every second and 32 kHz mono A
 
 | File | |
 |---|---|
-| `channels.go` | scans `Media/TV`, reads MP4 lengths from the `moov` box, and works out what's on air |
-| `player.go` | drives Onion's FFplay (2.4): clears its `pos.cfg` resume table so `-ss` works, overlays the channel number PNG with a timed `enable`, flips for the upside-down panel |
+| `channels.go` | scans `Media/TV` and `Commercials`, reads MP4 lengths from the `moov` box, orders shows, and lays out each channel's timetable with its commercial breaks |
+| `player.go` | drives Onion's FFplay (2.4): clears its `pos.cfg` resume table so `-ss` works, stops at a break with `-t`, overlays the channel number PNG with a timed `enable`, flips for the upside-down panel |
+| `menu.go`, `dvr.go` | the SETUP menu; DVR browsing, resume points and following FFplay's seek buttons |
 | `screens.go` | snow, CRT power on/off, OSD, the channel guide, colour bars |
 | `main.go` | the TV: input, tuning, auto-advance, sleep/wake resync |
 | `device.go`, `gfx.go` | framebuffer, input and drawing, shared with Rewind and Mixtape |
 
 ```sh
 ./build.sh                  # tests + dist/RabbitEars-vX.Y.Z-OnionOS.zip + dist/vhsify
-go run . -shot guide        # osd | info | guide | bars | nosignal | snow | on | off
+go run . -shot guide        # osd | info | ad | guide | menu | dvr | dvr2 | play | upnext | bars | nosignal | snow | on | off
 go run . -scan ~/tv         # print the lineup a folder would make
 ```
 

@@ -238,7 +238,7 @@ func osdWidth(f *Font, s string) int { return f.Width(s) }
 
 // RenderOSD draws the channel number (top right) and, for the DISPLAY
 // button, the programme and clock along the bottom, sized for a w×h video.
-func RenderOSD(fonts *Fonts, w, h int, ch *Channel, info *Airing, now time.Time) *image.NRGBA {
+func RenderOSD(fonts *Fonts, w, h int, ch *Channel, info *Airing, note string, now time.Time) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	u := float64(h) / 240
 	px := func(v float64) int { return int(math.Round(v * u)) }
@@ -264,7 +264,10 @@ func RenderOSD(fonts *Fonts, w, h int, ch *Channel, info *Airing, now time.Time)
 		clock := strings.ToUpper(now.Format("3:04 PM"))
 		osdTextShadow(img, small, left, y, clock, osdGreen, sh)
 		left2 := fmt.Sprintf("%s LEFT", fmtDur(info.End.Sub(now)))
-		title := fitText(small, strings.ToUpper(info.Item.Title), w-left*2-osdWidth(small, left2)-px(12))
+		title := fitText(small, strings.ToUpper(info.Item.Label()), w-left*2-osdWidth(small, left2)-px(12))
+		if note != "" {
+			osdTextShadow(img, small, left, y-px(18), fitText(small, note, w-left*2), osdGreen, sh)
+		}
 		osdTextShadow(img, small, left, y+px(18), title, osdGreen, sh)
 		// a row of blocks showing how far into the programme we are
 		span := info.End.Sub(info.Start).Seconds()
@@ -291,6 +294,54 @@ func RenderOSD(fonts *Fonts, w, h int, ch *Channel, info *Airing, now time.Time)
 		osdTextShadow(img, small, right-osdWidth(small, left2), y+px(18), left2, osdGreen, sh)
 	}
 	return img
+}
+
+// RenderPlayOSD: the VCR-style "PLAY" (or resume point) shown when a DVR
+// episode starts.
+func RenderPlayOSD(fonts *Fonts, w, h int, title string, from float64) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	u := float64(h) / 240
+	px := func(v float64) int { return int(math.Round(v * u)) }
+	sh := max(px(1.5), 1)
+	big := fonts.VT(px(30))
+	small := fonts.VT(px(18))
+	label := "PLAY"
+	if from > 0 {
+		label = "PLAY  " + fmtClock(from)
+	}
+	x := px(14)
+	// a solid "play" triangle
+	tri := px(16)
+	for i := 0; i < tri; i++ {
+		hh := tri - i
+		for yy := -hh / 2; yy <= hh/2; yy++ {
+			for _, d := range [][2]int{{sh, sh}, {0, 0}} {
+				col := osdShadow
+				if d[0] == 0 {
+					col = osdGreen
+				}
+				o := (px(14)+tri/2+yy+d[1])*img.Stride + (x+i+d[0])*4
+				if o >= 0 && o+3 < len(img.Pix) {
+					img.Pix[o], img.Pix[o+1], img.Pix[o+2], img.Pix[o+3] = col.R, col.G, col.B, 255
+				}
+			}
+		}
+	}
+	osdTextShadow(img, big, x+tri+px(6), px(10), label, osdGreen, sh)
+	osdTextShadow(img, small, x, h-px(30), fitText(small, strings.ToUpper(title), w-2*x), osdGreen, sh)
+	return img
+}
+
+// fmtClock: 75 → "1:15", 3725 → "1:02:05".
+func fmtClock(sec float64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	t := int(sec + 0.5)
+	if t >= 3600 {
+		return fmt.Sprintf("%d:%02d:%02d", t/3600, t/60%60, t%60)
+	}
+	return fmt.Sprintf("%d:%02d", t/60, t%60)
 }
 
 func fmtDur(d time.Duration) string {
@@ -322,7 +373,7 @@ type Guide struct {
 	Sel, Top int
 }
 
-const guideRows = 6
+const guideRows = 5
 
 func DrawGuide(c *Canvas, fonts *Fonts, chans []*Channel, g *Guide, now time.Time, cur int) {
 	W := c.W
@@ -347,12 +398,12 @@ func DrawGuide(c *Canvas, fonts *Fonts, chans []*Channel, g *Guide, now time.Tim
 	slotStart := now.Truncate(30 * time.Minute)
 	colX := []int{196, 420}
 	c.Fill(0, 64, W, 26, rgb(0x0e, 0x22, 0x80))
-	c.Text(fonts.Body(14), 18, 69, "CH", guideDim)
-	c.Text(fonts.Body(14), colX[0]+10, 69, "ON NOW", guideYellow)
-	c.Text(fonts.Body(14), colX[1]+10, 69, "UP NEXT", guideDim)
+	c.Text(fonts.Body(15), 18, 68, "CH", guideDim)
+	c.Text(fonts.Body(15), colX[0]+10, 68, "ON NOW", guideYellow)
+	c.Text(fonts.Body(15), colX[1]+10, 68, "UP NEXT", guideDim)
 	_ = slotStart
 
-	rowH := 58
+	rowH := 71
 	y0 := 92
 	if g.Sel < g.Top {
 		g.Top = g.Sel
@@ -361,7 +412,7 @@ func DrawGuide(c *Canvas, fonts *Fonts, chans []*Channel, g *Guide, now time.Tim
 		g.Top = g.Sel - guideRows + 1
 	}
 	titleF := fonts.Body(17)
-	timeF := fonts.VT(18)
+	timeF := fonts.VT(22)
 	for r := 0; r < guideRows; r++ {
 		i := g.Top + r
 		y := y0 + r*rowH
@@ -376,31 +427,31 @@ func DrawGuide(c *Canvas, fonts *Fonts, chans []*Channel, g *Guide, now time.Tim
 			box = guideBlue2
 		}
 		c.Fill(8, y, colX[0]-12, rowH-4, box)
-		c.Text(fonts.VT(34), 16, y+6, fmt.Sprintf("%d", ch.Num), guideYellow)
-		nf := fonts.Body(13)
+		c.Text(fonts.VT(40), 16, y+8, fmt.Sprintf("%d", ch.Num), guideYellow)
+		nf := fonts.Body(15)
 		lines := nf.Wrap(strings.ToUpper(ch.Name), colX[0]-12-66)
 		if len(lines) > 2 {
 			lines = lines[:2]
 			lines[1] = fitText(nf, lines[1]+" ...", colX[0]-12-66)
 		}
-		ly := y + 10
+		ly := y + 14
 		if len(lines) == 1 {
-			ly = y + 18
+			ly = y + 24
 		}
 		if i == cur {
-			ly = y + 6
+			ly = y + 12
 			if len(lines) > 1 {
 				lines = lines[:1]
 				lines[0] = fitText(nf, lines[0], colX[0]-12-66)
 			}
 		}
 		for _, ln := range lines {
-			c.Text(nf, 64, ly, ln, guideWhite)
-			ly += 17
+			c.Text(nf, 66, ly, ln, guideWhite)
+			ly += 20
 		}
 		if i == cur {
-			c.Fill(64, y+31, 6, 6, guideCyan)
-			c.Text(fonts.Body(11), 74, y+28, "TUNED", guideCyan)
+			c.Fill(66, y+40, 7, 7, guideCyan)
+			c.Text(fonts.Body(13), 78, y+36, "TUNED", guideCyan)
 		}
 		air := ch.Upcoming(now, 2)
 		for k, a := range air {
@@ -414,7 +465,14 @@ func DrawGuide(c *Canvas, fonts *Fonts, chans []*Channel, g *Guide, now time.Tim
 				cell = guideBlue2
 			}
 			c.Fill(x, y, w, rowH-4, cell)
-			c.Text(titleF, x+10, y+8, titleF.Ellipsize(a.Item.Title, w-20), guideWhite)
+			tl := titleF.Wrap(a.Item.Label(), w-20)
+			if len(tl) > 2 {
+				tl = tl[:2]
+				tl[1] = fitText(titleF, tl[1]+" ...", w-20)
+			}
+			for j, ln := range tl {
+				c.Text(titleF, x+10, y+4+j*19, ln, guideWhite)
+			}
 			var when string
 			if k == 0 {
 				when = fmtDur(a.End.Sub(now)) + " LEFT"
@@ -422,13 +480,13 @@ func DrawGuide(c *Canvas, fonts *Fonts, chans []*Channel, g *Guide, now time.Tim
 				span := a.End.Sub(a.Start).Seconds()
 				if span > 0 {
 					p := now.Sub(a.Start).Seconds() / span
-					c.Fill(x+10, y+rowH-12, w-20, 3, rgb(0x0a, 0x1a, 0x60))
-					c.Fill(x+10, y+rowH-12, int(float64(w-20)*clamp01(p)), 3, guideCyan)
+					c.Fill(x+10, y+rowH-9, w-20, 3, rgb(0x0a, 0x1a, 0x60))
+					c.Fill(x+10, y+rowH-9, int(float64(w-20)*clamp01(p)), 3, guideCyan)
 				}
 			} else {
 				when = strings.ToUpper(a.Start.Format("3:04 PM"))
 			}
-			c.Text(timeF, x+10, y+28, when, guideDim)
+			c.Text(timeF, x+10, y+43, when, guideDim)
 		}
 		if sel {
 			c.Border(6, y-2, W-12, rowH, 2, guideYellow)
@@ -446,6 +504,7 @@ func DrawGuide(c *Canvas, fonts *Fonts, chans []*Channel, g *Guide, now time.Tim
 	bf := fonts.Body(14)
 	x := c.Button(bf, 18, fy+6, "A", "WATCH", guideWhite)
 	x = c.Button(bf, x+8, fy+6, "B", "BACK", guideWhite)
+	x = c.Button(bf, x+8, fy+6, "START", "SETUP", guideWhite)
 	c.Button(bf, x+8, fy+6, "MENU", "TURN OFF", guideWhite)
 }
 

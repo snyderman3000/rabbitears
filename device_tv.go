@@ -60,3 +60,57 @@ func (fb *Framebuffer) Capture(c *Canvas) bool {
 	}
 	return true
 }
+
+// PresentFit shows a canvas of any size on the panel, scaling it when the
+// panel isn't 640x480 (the Mini V4 is 750x560), so text keeps its size.
+func (fb *Framebuffer) PresentFit(c *Canvas) {
+	if c.W == fb.W && c.H == fb.H {
+		fb.Present(c)
+		return
+	}
+	if fb.scaled == nil || fb.scaled.W != fb.W || fb.scaled.H != fb.H {
+		fb.scaled = NewCanvas(fb.W, fb.H)
+	}
+	scaleInto(fb.scaled, c)
+	fb.Present(fb.scaled)
+}
+
+// CaptureFit reads the screen into a canvas of any size.
+func (fb *Framebuffer) CaptureFit(c *Canvas) bool {
+	if c.W == fb.W && c.H == fb.H {
+		return fb.Capture(c)
+	}
+	full := NewCanvas(fb.W, fb.H)
+	if !fb.Capture(full) {
+		return false
+	}
+	scaleInto(c, full)
+	return true
+}
+
+// scaleInto resizes src onto dst (bilinear: small upscales stay smooth).
+func scaleInto(dst, src *Canvas) {
+	sx := float64(src.W-1) / float64(max(dst.W-1, 1))
+	sy := float64(src.H-1) / float64(max(dst.H-1, 1))
+	for y := 0; y < dst.H; y++ {
+		fy := float64(y) * sy
+		y0 := int(fy)
+		y1 := min(y0+1, src.H-1)
+		wy := fy - float64(y0)
+		r0 := src.Pix[y0*src.Stride:]
+		r1 := src.Pix[y1*src.Stride:]
+		d := dst.Pix[y*dst.Stride:]
+		for x := 0; x < dst.W; x++ {
+			fx := float64(x) * sx
+			x0 := int(fx)
+			x1 := min(x0+1, src.W-1)
+			wx := fx - float64(x0)
+			for k := 0; k < 3; k++ {
+				a := float64(r0[x0*4+k])*(1-wx) + float64(r0[x1*4+k])*wx
+				b := float64(r1[x0*4+k])*(1-wx) + float64(r1[x1*4+k])*wx
+				d[x*4+k] = uint8(a*(1-wy) + b*wy + 0.5)
+			}
+			d[x*4+3] = 255
+		}
+	}
+}
